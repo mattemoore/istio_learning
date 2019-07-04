@@ -1,0 +1,112 @@
+
+INSTALL AWS CLI
+Sudo apt install awscli
+aws configure
+export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+export CLUSTER_NAME=istiocluster.k8s.local
+export KOPS_STATE_STORE=s3://kops-state-store
+
+CREATE IAM USER FOR KOPS
+aws iam create-group --group-name kops
+aws iam attach-group-policy --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess --group-name kops
+aws iam attach-group-policy --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess --group-name kops
+aws iam attach-group-policy --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess --group-name kops
+aws iam attach-group-policy --policy-arn arn:aws:iam::aws:policy/IAMFullAccess --group-name kops
+aws iam attach-group-policy --policy-arn arn:aws:iam::aws:policy/AmazonVPCFullAccess --group-name kops
+aws iam create-user --user-name kops
+aws iam add-user-to-group --user-name kops --group-name kops
+aws iam create-access-key --user-name kops
+
+CREATE S3 BUCKET TO STORE KOPS STATE
+aws s3api create-bucket --bucket kops-state-store --region us-east-1
+aws s3api put-bucket-versioning --bucket kops-state-store  --versioning-configuration Status=Enabled
+aws s3api put-bucket-encryption --bucket kops-state-store --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+INSTALL KOPS
+curl -Lo kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
+chmod +x ./kops
+sudo mv ./kops /usr/local/bin/
+
+INSTALL KUBECTL
+curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin/kubectl
+
+CREATE CLUSTER
+ssh-keygen
+kops create secret --name ${CLUSTER_NAME} sshpublickey admin -i ~/.ssh/id_rsa.pub
+kops create cluster --zones us-east-1a ${CLUSTER_NAME}
+kops edit cluster ${CLUSTER_NAME}
+kops update cluster ${CLUSTER_NAME} --yes
+...wait a bit for cluster to start up...
+kops rolling-update cluster --cloudonly
+
+INSTALL ISTIO
+curl -L https://git.io/getLatestIstio | sh -
+cd istio-1.0.6
+export PATH=$PWD/bin:$PATH
+kubectl apply -f install/kubernetes/istio-demo.yaml 
+*sometimes have to do above twice*
+
+ENABLE AUTO SIDECAR INJECTION
+kubectl api-versions | grep admissionregistration
+
+VERIFY ISTIO INSTALL
+kubectl get svc -n istio-system
+kubectl get pods -n istio-system
+
+DEPLOY TEST APPLICATION
+kubectl label namespace default istio-injection=enabled
+kubectl apply -f samples/bookinfo/platform/kube/bookinfo.yaml
+kubectl get services
+kubectl get pods
+
+SETUP ISTIO INGRESS
+kubectl apply -f samples/bookinfo/networking/bookinfo-gateway.yaml
+kubectl get gateway
+kubectl get svc istio-ingressgateway -n istio-system
+export INGRESS_HOST=$(kubectl -n istio-system get service istio-ingressgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+export SECURE_INGRESS_PORT=$(kubectl -n istio-system get service istio-ingressgateway -o jsonpath='{.spec.ports[?(@.name=="https")].port}')
+export GATEWAY_URL=$INGRESS_HOST:$INGRESS_PORT
+curl -o /dev/null -s -w "%{http_code}\n" http://${GATEWAY_URL}/productpage
+*confirm 200 returned - app is up and running*
+*open browser and point to 'http://${GATEWAY_URL}/productpage' to see the ui*
+
+INSTALL AMBASSADOR GATEWAY
+kubectl apply -f https://getambassador.io/yaml/ambassador/ambassador-rbac.yaml
+nano ambassador-service.yaml
+*paste following and save*
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    service: ambassador
+  name: ambassador
+  annotations:
+    getambassador.io/config: |
+      ---
+      apiVersion: ambassador/v1
+      kind:  Mapping
+      name:  httpbin_mapping
+      prefix: /httpbin/
+      service: httpbin.org:80
+      host_rewrite: httpbin.org
+spec:
+  type: LoadBalancer
+  ports:
+  - name: ambassador
+    port: 80
+    targetPort: 80
+  selector:
+    service: ambassador
+*end of paste*
+kubectl apply -f ambassador-service.yaml
+kubectl get services
+kubectl get pods
+export AMBASSADORIP=$(kubectl get services ambassador | tail -1 | awk '{ print $4 }')
+curl $AMBASSADORIP/httpbin/ip
+
+DELETE CLUSTER
+kops delete cluster --name ${CLUSTER_NAME} --yes
+
